@@ -1,0 +1,142 @@
+import cv2 
+import numpy as np 
+import onnxruntime as ort 
+import RPi.GPIO as GPIO 
+from picamera2 import Picamera2 
+import time 
+ZONE_PINS = { 
+"zone1": 17, 
+"zone2": 27, 
+"zone3": 22, 
+"zone4": 23 
+} 
+GPIO.setmode(GPIO.BCM) 
+for pin in ZONE_PINS.values(): 
+GPIO.setup(pin, GPIO.OUT) 
+GPIO.output(pin, GPIO.HIGH) 
+# Load ONNX model 
+session = ort.InferenceSession("/home/raspberryss/FYP/best.onnx") 
+input_name = session.get_inputs()[0].name 
+# Camera Setup 
+picam2 = Picamera2() 
+picam2.configure(picam2.create_preview_configuration( 
+main={"format": "RGB888", "size": (640, 480)} 
+)) 
+picam2.start() 
+time.sleep(2) 
+def preprocess(frame): 
+57 
+58  
+    img = cv2.resize(frame, (640, 640)) 
+    img = img.astype(np.float32) / 255.0 
+    img = np.transpose(img, (2, 0, 1)) 
+    img = np.expand_dims(img, axis=0) 
+    return img 
+def postprocess(outputs, frame_w, frame_h, conf_threshold=0.5, nms_threshold=0.45): 
+    predictions = outputs[0][0] 
+    boxes = [] 
+    scores = [] 
+    for pred in predictions.T: 
+        confidence = pred[4] 
+        if confidence > conf_threshold: 
+            cx, cy, w, h = pred[0], pred[1], pred[2], pred[3] 
+            x1 = int((cx - w/2) * frame_w / 640) 
+            y1 = int((cy - h/2) * frame_h / 640) 
+            x2 = int((cx + w/2) * frame_w / 640) 
+            y2 = int((cy + h/2) * frame_h / 640) 
+            boxes.append([x1, y1, x2-x1, y2-y1]) 
+            scores.append(float(confidence)) 
+    indices = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, nms_threshold) 
+    final_boxes = [] 
+    if len(indices) > 0: 
+        for i in indices.flatten(): 
+            x, y, w, h = boxes[i] 
+            final_boxes.append((x, y, x+w, y+h)) 
+    return final_boxes 
+ 
+DELAY = 10 
+59  
+zone_last_detected = { 
+    "zone1": 0, 
+    "zone2": 0, 
+    "zone3": 0, 
+    "zone4": 0 
+} 
+try: 
+    while True: 
+        frame = picam2.capture_array() 
+        h, w, _ = frame.shape 
+        input_tensor = preprocess(frame) 
+        outputs = session.run(None, {input_name: input_tensor}) 
+        boxes = postprocess(outputs, w, h) 
+        current_time = time.time() 
+        count_zone1 = 0 
+        count_zone2 = 0 
+        count_zone3 = 0 
+        count_zone4 = 0 
+        # draw zones 
+        cv2.line(frame, (w//2, 0), (w//2, h), (255,255,255), 2) 
+        cv2.line(frame, (0, h//2), (w, h//2), (255,255,255), 2) 
+        for (x1, y1, x2, y2) in boxes: 
+            cx = (x1+x2)//2 
+            cy = (y1+y2)//2 
+            if cx < w//2 and cy < h//2: 
+                zone_last_detected["zone1"] = current_time 
+                count_zone1 += 1 
+            elif cx >= w//2 and cy < h//2: 
+60  
+                zone_last_detected["zone2"] = current_time 
+                count_zone2 += 1 
+            elif cx < w//2 and cy >= h//2: 
+                zone_last_detected["zone3"] = current_time 
+                count_zone3 += 1 
+            else: 
+                zone_last_detected["zone4"] = current_time 
+                count_zone4 += 1 
+            # draw detection 
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2) 
+            cv2.circle(frame, (cx,cy), 5, (0,0,255), -1) 
+        # zone ON/OFF 
+        zone1 = "ON" if (current_time - zone_last_detected["zone1"]) < DELAY else "OFF" 
+        zone2 = "ON" if (current_time - zone_last_detected["zone2"]) < DELAY else "OFF" 
+        zone3 = "ON" if (current_time - zone_last_detected["zone3"]) < DELAY else "OFF" 
+        zone4 = "ON" if (current_time - zone_last_detected["zone4"]) < DELAY else "OFF" 
+        total_count = count_zone1 + count_zone2 + count_zone3 + count_zone4 
+        # GPIO control 
+        GPIO.output(ZONE_PINS["zone1"], GPIO.LOW if zone1=="ON" else GPIO.HIGH) 
+        GPIO.output(ZONE_PINS["zone2"], GPIO.LOW if zone2=="ON" else GPIO.HIGH) 
+        GPIO.output(ZONE_PINS["zone3"], GPIO.LOW if zone3=="ON" else GPIO.HIGH) 
+        GPIO.output(ZONE_PINS["zone4"], GPIO.LOW if zone4=="ON" else GPIO.HIGH) 
+        # clear terminal 
+        print("\033c", end="") 
+        print("========== ZONE COUNT ==========") 
+        print(f"Zone 1 : {count_zone1}") 
+        print(f"Zone 2 : {count_zone2}") 
+        print(f"Zone 3 : {count_zone3}") 
+61  
+        print(f"Zone 4 : {count_zone4}") 
+        print("-------------------------------") 
+        print(f"Total  : {total_count}") 
+        print("================================") 
+        # display counts 
+        cv2.putText(frame, f"Z1: {count_zone1}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2) 
+        cv2.putText(frame, f"Z2: {count_zone2}", (w//2+10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2) 
+        cv2.putText(frame, f"Z3: {count_zone3}", (10, h//2+30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2) 
+        cv2.putText(frame, f"Z4: {count_zone4}", (w//2+10, h//2+30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2) 
+        cv2.putText(frame, f"Total: {total_count}", (w//2-70, h-10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2) 
+        cv2.imshow("Zone Detection", frame) 
+        if cv2.waitKey(1) & 0xFF == ord('q'): 
+            break 
+except KeyboardInterrupt: 
+    print("Stopped!") 
+finally: 
+    picam2.stop() 
+    cv2.destroyAllWindows() 
+    for pin in ZONE_PINS.values(): 
+        GPIO.output(pin, GPIO.HIGH) 
+    GPIO.cleanup()
